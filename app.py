@@ -1,253 +1,474 @@
+"""
+SpectraNLP - A comprehensive sentiment analysis platform.
+This is the main application file for the Streamlit interface.
+"""
 import streamlit as st
 import pandas as pd
+from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
-from datetime import datetime
-from flickrapi import FlickrAPI
-import html
-import re
-import time
+import plotly.graph_objects as go
+from wordcloud import WordCloud
 import nltk
-from nltk.sentiment.vader import SentimentIntensityAnalyzer
+import re
+import os
+import time
 
 
-nltk.download("vader_lexicon")
-sid = SentimentIntensityAnalyzer()
+from data_collectors.flickr_collector import FlickrCollector
+from data_collectors.nyt_collector import NYTCollector
+from data_collectors.reddit_collector import RedditCollector
+from analysis.sentiment_analyzer import SentimentAnalyzer
+from analysis.text_processor import TextProcessor
+from visualization.sentiment_plots import SentimentPlots
+from visualization.trend_plots import TrendPlots
+from utils.helpers import standardize_dataframe, merge_dataframes
+import config
 
+# Ensure required NLTK data is downloaded
+try:
+    nltk.data.find('sentiment/vader_lexicon.zip')
+    nltk.data.find('tokenizers/punkt')
+    nltk.data.find('corpora/stopwords')
+except LookupError:
+    nltk.download('vader_lexicon')
+    nltk.download('punkt')
+    nltk.download('stopwords')
 
-API_KEY = "6121804e178a34ebe49444e858987ee5"
-API_SECRET = "0995d081c0eccf00"
-flickr = FlickrAPI(API_KEY, API_SECRET, format="parsed-json")
+# Set page configuration
+st.set_page_config(
+    page_title="SpectraNLP - Sentiment Analysis",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-
-def clean_comment_text(text):
-    text = html.unescape(text)
-    text = re.sub(r"https?://\S+", "", text)
-    text = re.sub(r"<[^>]+>", "", text)
-    text = re.sub(r"[^\x00-\x7F]+", "", text)
-    text = " ".join(text.split()).strip()
-    return text if len(text) > 3 else None
-
-
-def analyze_sentiment(text):
-    scores = sid.polarity_scores(text)
-    if scores["compound"] >= 0.05:
-        sentiment = "Positive"
-    elif scores["compound"] <= -0.05:
-        sentiment = "Negative"
-    else:
-        sentiment = "Neutral"
-    return sentiment, scores["compound"]
-
-
-def fetch_comments(photo_ids):
-    comment_data = []
-    photo_comment_counts = {}
-    for photo_id in photo_ids:
-        try:
-            response = flickr.photos.comments.getList(photo_id=photo_id)
-            comments = response.get("comments", {}).get("comment", [])
-            photo_comment_counts[photo_id] = len(comments)
-            for comment in comments:
-                comment_text = clean_comment_text(comment.get("_content", ""))
-                if comment_text:
-                    sentiment, score = analyze_sentiment(comment_text)
-                    comment_data.append(
-                        {
-                            "photo_id": photo_id,
-                            "author": comment.get("authorname", ""),
-                            "date": datetime.fromtimestamp(
-                                int(comment.get("datecreate", 0))
-                            ).strftime("%Y-%m-%d"),
-                            "comment_text": comment_text,
-                            "sentiment": sentiment,
-                            "sentiment_score": score,
-                        }
-                    )
-            time.sleep(1)
-        except Exception as e:
-            print(f"Error fetching comments for photo ID {photo_id}: {e}")
-    return pd.DataFrame(comment_data), photo_comment_counts
-
-
-def search_for_photos(keyword, start_date, end_date, num_images=100):
-    start = int(datetime.strptime(start_date, "%Y-%m-%d").timestamp())
-    end = int(datetime.strptime(end_date, "%Y-%m-%d").timestamp())
-    photos = flickr.photos.search(
-        tags=keyword,
-        tag_mode="all",
-        min_upload_date=start,
-        max_upload_date=end,
-        per_page=num_images,
-        sort="date-posted-desc",
-        extras="date_upload",
-    )
-    photo_data = []
-    for photo in photos["photos"]["photo"]:
-        photo_url = f"https://farm{photo['farm']}.staticflickr.com/{photo['server']}/{photo['id']}_{photo['secret']}.jpg"
-        photo_data.append(
-            {
-                "id": photo["id"],
-                "title": photo["title"],
-                "url": photo_url,
-            }
-        )
-    return photo_data
-
-
-def plot_sentiment_trends(comments_df):
-    comments_df["date"] = pd.to_datetime(comments_df["date"])
-
-    sentiment_counts = (
-        comments_df.groupby(["date", "sentiment"]).size().reset_index(name="count")
-    )
-
-    sentiment_pivot = sentiment_counts.pivot(
-        index="date", columns="sentiment", values="count"
-    ).fillna(0)
-
-    plt.figure(figsize=(10, 6))
-    plt.plot(
-        sentiment_pivot.index,
-        sentiment_pivot.get("Positive", 0),
-        label="Positive",
-        marker="o",
-    )
-    plt.plot(
-        sentiment_pivot.index,
-        sentiment_pivot.get("Neutral", 0),
-        label="Neutral",
-        marker="o",
-    )
-    plt.plot(
-        sentiment_pivot.index,
-        sentiment_pivot.get("Negative", 0),
-        label="Negative",
-        marker="o",
-    )
-
-    plt.title("Sentiment Trends Over Time")
-    plt.xlabel("Date")
-    plt.ylabel("Count")
-    plt.legend(title="Sentiment")
-    plt.xticks(rotation=45)
-    plt.grid(True)
-    st.pyplot(plt)
-
-
-def highlight_emotion_keywords(text, emotion_words):
+# Cache frequently used data
+@st.cache_data(ttl=10)  # Cache for 1 hour
+def load_cached_data(source, keywords, start_date, end_date, max_results=100):
     """
-    Highlight Sentiment Keywords
-    :param text: comment text
-    :param emotion_words: list of emotion keywords
-    :return: HTML text with highlighting effect
+    Load data with caching to prevent repeated API calls.
     """
-    for word in emotion_words:
-        text = re.sub(
-            f"\\b({re.escape(word)})\\b", r"<mark>\1</mark>", text, flags=re.IGNORECASE
-        )
-    return text
+    if source == "Flickr":
+        collector = FlickrCollector()
+        data = collector.collect_data(keywords, start_date, end_date, max_results)
+        return standardize_dataframe(data, source)
 
-
-def analyze_sentiment_with_keywords(text):
-    """
-    Analyze the text sentiment and extract the keywords that contribute most to the sentiment score
-    :param text: text of the input comments
-    :return: sentiment type, sentiment score, sentiment keywords
-    """
-
-    scores = sid.polarity_scores(text)
-
-    sentiment = "Neutral"
-    if scores["compound"] >= 0.05:
-        sentiment = "Positive"
-    elif scores["compound"] <= -0.05:
-        sentiment = "Negative"
-
-    words = text.split()
-    emotion_words = []
-    for word in words:
-        if word.lower() in sid.lexicon:
-            emotion_words.append(word)
-
-    return sentiment, scores["compound"], emotion_words
-
-
-def main():
-    st.title("Flickr Sentiment Analysis with Emotion Keywords")
-    st.write(
-        "Analyze public sentiment on Flickr comments over time based on specific keywords."
-    )
-
-    keyword = st.text_input("Enter keyword (e.g., 'Gaza', 'Palestine'):", "Gaza")
-    start_date = st.date_input("Start Date:", datetime(2023, 1, 1))
-    end_date = st.date_input("End Date:", datetime(2024, 11, 1))
-    num_images = st.slider("Number of photos to analyze per keyword:", 10, 500, 100)
-
-    if st.button("Run Analysis"):
-        st.write(f"Searching photos for keyword: {keyword}")
-        photos = search_for_photos(
-            keyword,
-            start_date.strftime("%Y-%m-%d"),
-            end_date.strftime("%Y-%m-%d"),
-            num_images,
-        )
-
-        if photos:
-            st.write(f"Found {len(photos)} photos. Fetching comments for analysis...")
-            photo_ids = [photo["id"] for photo in photos]
-            comments_df, photo_comment_counts = fetch_comments(photo_ids)
-
-            # Sort by the number of comments and keep the first four photos
-            sorted_photos = sorted(
-                photos, key=lambda x: photo_comment_counts.get(x["id"], 0), reverse=True
-            )[:4]
-
-            st.write("Displaying top 4 photos with most comments...")
-
-            for i in range(0, len(sorted_photos), 2):
-                cols = st.columns(2)
-                for j, photo in enumerate(sorted_photos[i : i + 2]):
-                    with cols[j]:
-                        st.image(
-                            photo["url"],
-                            caption=f"{photo['title']} ({photo_comment_counts.get(photo['id'], 0)} comments)",
-                            use_column_width=True,
-                        )
-
-                        with st.expander(
-                            f"View Comments for '{photo['title']}'", expanded=False
-                        ):
-                            photo_comments = comments_df[
-                                comments_df["photo_id"] == photo["id"]
-                            ]
-                            st.write("### Comments:")
-                            for _, comment in photo_comments.iterrows():
-                                sentiment, score, emotion_words = (
-                                    analyze_sentiment_with_keywords(
-                                        comment["comment_text"]
-                                    )
-                                )
-                                highlighted_comment = highlight_emotion_keywords(
-                                    comment["comment_text"], emotion_words
-                                )
-                                st.markdown(
-                                    f"- **{comment['author']}**: {highlighted_comment} "
-                                    f"(Sentiment: {sentiment}, Score: {score:.2f})",
-                                    unsafe_allow_html=True,
-                                )
-
-            if not comments_df.empty:
-                st.success("Analysis complete!")
-                st.write("### Sentiment Analysis Results")
-                st.dataframe(comments_df)
-
-                st.write("### Sentiment Trends Over Time")
-                plot_sentiment_trends(comments_df)
-            else:
-                st.warning("No comments found for the selected photos.")
+    elif source == "NYT":
+        collector = NYTCollector()
+        data = collector.collect_data(keywords, start_date, end_date, max_results)
+        if 'lead_paragraph' in data.columns:
+            data = standardize_dataframe(data, source, text_col='lead_paragraph', date_col='pub_date')
         else:
-            st.error("No photos found for the given keyword and date range.")
+            data = standardize_dataframe(data, source)
+        return data
 
+    elif source == "Reddit":
+        # For Reddit, we'll use a static file if it exists
+        try:
+            csv_file = "reddit_comments.csv"  # Default file name
+            if os.path.exists(csv_file):
+                data = pd.read_csv(csv_file)
+
+                # Filter by date and keywords
+                if 'created_time' in data.columns:
+                    data['created_time'] = pd.to_datetime(data['created_time'])
+                    data = data[(data['created_time'] >= start_date) & (data['created_time'] <= end_date)]
+
+                if keywords and 'text' in data.columns:
+                    # Filter for rows containing any of the keywords
+                    keyword_pattern = '|'.join(keywords)
+                    data = data[data['text'].str.contains(keyword_pattern, case=False, na=False)]
+
+                return standardize_dataframe(data, source, text_col='text', date_col='created_time')
+            else:
+                st.warning(f"Reddit data file '{csv_file}' not found. Please provide a valid data file.")
+                return pd.DataFrame()
+        except Exception as e:
+            st.error(f"Error loading Reddit data: {e}")
+            return pd.DataFrame()
+
+    return pd.DataFrame()
+
+@st.cache_resource
+def get_sentiment_analyzer():
+    """Get a cached sentiment analyzer instance."""
+    return SentimentAnalyzer()
+
+@st.cache_resource
+def get_text_processor():
+    """Get a cached text processor instance."""
+    return TextProcessor()
+
+# App title
+st.title("SpectraNLP - Sentiment Analysis Platform")
+st.markdown("""
+    Analyze sentiment across multiple data sources related to keywords of interest.
+    This application processes data from Flickr comments, New York Times articles, and Reddit discussions.
+""")
+
+# Sidebar for controls
+st.sidebar.header("Settings")
+
+# Data source selection
+st.sidebar.subheader("Data Sources")
+use_flickr = st.sidebar.checkbox("Flickr", value=True)
+use_nyt = st.sidebar.checkbox("New York Times", value=True)
+use_reddit = st.sidebar.checkbox("Reddit", value=True)
+
+# Date range selection
+st.sidebar.subheader("Date Range")
+default_end_date = datetime.now()
+default_start_date = default_end_date - timedelta(days=30)
+
+start_date = st.sidebar.date_input(
+    "Start Date",
+    value=default_start_date,
+    max_value=default_end_date
+)
+
+end_date = st.sidebar.date_input(
+    "End Date",
+    value=default_end_date,
+    min_value=start_date,
+    max_value=default_end_date
+)
+
+# Convert to string format for API calls
+start_date_str = start_date.strftime('%Y-%m-%d')
+end_date_str = end_date.strftime('%Y-%m-%d')
+
+# Keywords selection
+st.sidebar.subheader("Keywords")
+default_keywords = config.DEFAULT_SEARCH_TERMS
+keyword_input = st.sidebar.text_area(
+    "Enter keywords (one per line)",
+    '\n'.join(default_keywords)
+)
+keywords = [k.strip() for k in keyword_input.split('\n') if k.strip()]
+
+# Number of results to fetch
+max_results = st.sidebar.slider(
+    "Maximum results per source",
+    min_value=10,
+    max_value=500,
+    value=100,
+    step=10
+)
+
+# Analysis button
+run_analysis = st.sidebar.button("Run Analysis", type="primary")
+
+# Advanced settings
+with st.sidebar.expander("Advanced Settings"):
+    preprocess_text = st.checkbox("Preprocess text", value=True)
+    show_wordcloud = st.checkbox("Show word clouds", value=True)
+    time_interval = st.selectbox(
+        "Time grouping",
+        options=[("Day", "D"), ("Week", "W"), ("Month", "M"), ("Year", "Y")],
+        format_func=lambda x: x[0],
+        index=2  # Month as default
+    )[1]  # Get the code (D, W, M, Y)
+
+# Display processing status
+status_container = st.empty()
+
+if run_analysis:
+    # Initialize data containers
+    all_data = []
+    sources_data = {}
+    sentiment_data = pd.DataFrame()
+
+    with status_container.container():
+        st.info("Analysis in progress...")
+        progress_bar = st.progress(0)
+
+        # Data collection
+        step = 0
+        num_steps = sum([use_flickr, use_nyt, use_reddit]) * 2  # Collection + Analysis
+
+        # Flickr data
+        if use_flickr:
+            st.write("Collecting Flickr data...")
+            flickr_data = load_cached_data("Flickr", keywords, start_date_str, end_date_str, max_results)
+            if not flickr_data.empty:
+                all_data.append(flickr_data)
+                sources_data["Flickr"] = flickr_data
+                st.write(f"✅ Collected {len(flickr_data)} Flickr comments")
+            else:
+                st.write("⚠️ No Flickr data found")
+
+            step += 1
+            progress_bar.progress(step / num_steps)
+
+        # NYT data
+        if use_nyt:
+            st.write("Collecting New York Times data...")
+            nyt_data = load_cached_data("NYT", keywords, start_date_str, end_date_str, max_results)
+            if not nyt_data.empty:
+                all_data.append(nyt_data)
+                sources_data["New York Times"] = nyt_data
+                st.write(f"✅ Collected {len(nyt_data)} NYT articles")
+            else:
+                st.write("⚠️ No NYT data found")
+
+            step += 1
+            progress_bar.progress(step / num_steps)
+
+        # Reddit data
+        if use_reddit:
+            st.write("Collecting Reddit data...")
+            reddit_data = load_cached_data("Reddit", keywords, start_date_str, end_date_str, max_results)
+            if not reddit_data.empty:
+                all_data.append(reddit_data)
+                sources_data["Reddit"] = reddit_data
+                st.write(f"✅ Collected {len(reddit_data)} Reddit comments")
+            else:
+                st.write("⚠️ No Reddit data found")
+
+            step += 1
+            progress_bar.progress(step / num_steps)
+
+        # Merge and process data
+        if all_data:
+            combined_data = merge_dataframes(all_data)
+            st.write(f"Combined dataset: {len(combined_data)} records")
+
+            # Text preprocessing
+            if preprocess_text:
+                st.write("Preprocessing text...")
+                text_processor = get_text_processor()
+                combined_data = text_processor.preprocess_dataframe(combined_data, text_column='text', new_column='processed_text')
+                text_col = 'processed_text'
+            else:
+                text_col = 'text'
+
+            # Sentiment analysis
+            sentiment_analyzer = get_sentiment_analyzer()
+
+            for source, data in sources_data.items():
+                st.write(f"Analyzing {source} sentiment...")
+                if not data.empty:
+                    # Use processed text if available
+                    if preprocess_text and 'processed_text' in data.columns:
+                        analysis_col = 'processed_text'
+                    else:
+                        analysis_col = 'text'
+
+                    sources_data[source] = sentiment_analyzer.analyze_dataframe(data, text_column=analysis_col)
+
+                step += 1
+                progress_bar.progress(step / num_steps)
+
+            # Combine all sentiment-analyzed data
+            sentiment_data_list = [df for df in sources_data.values() if not df.empty]
+            if sentiment_data_list:
+                sentiment_data = merge_dataframes(sentiment_data_list)
+                st.write(f"Sentiment analysis complete: {len(sentiment_data)} records analyzed")
+            else:
+                st.error("No data available for sentiment analysis")
+
+            # Remove progress indicators when done
+            progress_bar.empty()
+            st.success("Analysis complete!")
+            time.sleep(1)  # Brief pause to show completion
+
+    # Clear the status container
+    status_container.empty()
+
+    # Display results if data is available
+    if not sentiment_data.empty:
+        st.header("Sentiment Analysis Results")
+
+        # Overall statistics
+        st.subheader("Overall Statistics")
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            total_records = len(sentiment_data)
+            st.metric("Total Records", total_records)
+
+        with col2:
+            positive_percentage = (sentiment_data['sentiment'] == 'Positive').mean() * 100
+            st.metric("Positive Sentiment", f"{positive_percentage:.1f}%")
+
+        with col3:
+            negative_percentage = (sentiment_data['sentiment'] == 'Negative').mean() * 100
+            st.metric("Negative Sentiment", f"{negative_percentage:.1f}%")
+
+        # Data source breakdown
+        st.subheader("Data Source Breakdown")
+
+        source_counts = sentiment_data['source'].value_counts()
+        st.bar_chart(source_counts)
+
+        # Sentiment distribution
+        st.subheader("Sentiment Distribution")
+        try:
+            sentiment_dist_fig = SentimentPlots.plot_sentiment_distribution(sentiment_data)
+            st.plotly_chart(sentiment_dist_fig, use_container_width=True)
+        except Exception as e:
+            st.error(f"Error plotting sentiment distribution: {e}")
+
+        # Sentiment over time
+        st.subheader("Sentiment Trends Over Time")
+        try:
+            sentiment_time_fig = SentimentPlots.plot_sentiment_over_time(
+                sentiment_data,
+                date_col='date',
+                interval=time_interval
+            )
+            st.plotly_chart(sentiment_time_fig, use_container_width=True)
+        except Exception as e:
+            st.error(f"Error plotting sentiment trends: {e}")
+
+        # Sentiment intensity
+        st.subheader("Sentiment Intensity Over Time")
+        try:
+            sentiment_intensity_fig = TrendPlots.plot_sentiment_intensity(
+                sentiment_data,
+                date_col='date',
+                score_col='sentiment_score',
+                interval=time_interval
+            )
+            st.plotly_chart(sentiment_intensity_fig, use_container_width=True)
+        except Exception as e:
+            st.error(f"Error plotting sentiment intensity: {e}")
+
+        # Source comparison
+        if len(sources_data) > 1:
+            st.subheader("Sentiment Comparison Across Sources")
+            try:
+                source_comparison_fig = TrendPlots.plot_source_comparison(sources_data)
+                st.plotly_chart(source_comparison_fig, use_container_width=True)
+            except Exception as e:
+                st.error(f"Error plotting source comparison: {e}")
+
+        # Keyword comparison
+        if len(keywords) > 1:
+            st.subheader("Keyword Sentiment Comparison")
+            try:
+                keyword_comparison_fig = TrendPlots.plot_keyword_comparison(
+                    sentiment_data,
+                    keywords,
+                    text_col=text_col
+                )
+                st.pyplot(keyword_comparison_fig)
+            except Exception as e:
+                st.error(f"Error plotting keyword comparison: {e}")
+
+        # Word clouds
+        if show_wordcloud:
+            st.subheader("Word Clouds by Sentiment")
+            col1, col2, col3 = st.columns(3)
+
+            try:
+                with col1:
+                    st.write("Positive Sentiment")
+                    positive_cloud = SentimentPlots.plot_sentiment_wordcloud(
+                        sentiment_data,
+                        text_col=text_col,
+                        sentiment_filter='Positive'
+                    )
+                    st.pyplot(positive_cloud)
+
+                with col2:
+                    st.write("Neutral Sentiment")
+                    neutral_cloud = SentimentPlots.plot_sentiment_wordcloud(
+                        sentiment_data,
+                        text_col=text_col,
+                        sentiment_filter='Neutral'
+                    )
+                    st.pyplot(neutral_cloud)
+
+                with col3:
+                    st.write("Negative Sentiment")
+                    negative_cloud = SentimentPlots.plot_sentiment_wordcloud(
+                        sentiment_data,
+                        text_col=text_col,
+                        sentiment_filter='Negative'
+                    )
+                    st.pyplot(negative_cloud)
+            except Exception as e:
+                st.error(f"Error generating word clouds: {e}")
+
+        # Sample data with highlighted sentiment
+        st.subheader("Sample Data with Sentiment Highlights")
+
+        # Sample selection
+        num_samples = min(10, len(sentiment_data))
+        sample_type = st.radio(
+            "Sample type",
+            ["Random", "Most Positive", "Most Negative"],
+            horizontal=True
+        )
+
+        if sample_type == "Random":
+            samples = sentiment_data.sample(num_samples)
+        elif sample_type == "Most Positive":
+            samples = sentiment_data.sort_values('sentiment_score', ascending=False).head(num_samples)
+        else:  # Most Negative
+            samples = sentiment_data.sort_values('sentiment_score', ascending=True).head(num_samples)
+
+        for i, (_, row) in enumerate(samples.iterrows()):
+            sentiment_color = {
+                'Positive': '#4CAF50',  # Green
+                'Neutral': '#FFC107',   # Amber
+                'Negative': '#F44336'   # Red
+            }.get(row['sentiment'], '#757575')  # Gray default
+
+            with st.expander(f"Sample {i+1} - {row['source']} ({row['sentiment']})"):
+                st.markdown(f"**Date:** {row['date']}")
+
+                # Prepare text with highlighted emotion words
+                if 'emotion_words' in row and row['emotion_words']:
+                    emotion_words = row['emotion_words'].split(',')
+                    text = row['text']
+
+                    # Highlight emotion words
+                    for word in sorted(emotion_words, key=len, reverse=True):
+                        if word in text:
+                            text = text.replace(
+                                word,
+                                f'<span style="background-color: {sentiment_color}; color: white; padding: 1px 3px; border-radius: 2px;">{word}</span>'
+                            )
+
+                    st.markdown(text, unsafe_allow_html=True)
+                else:
+                    st.write(row['text'])
+
+                # Display sentiment score with gauge
+                st.markdown(f"""
+                    <div style="text-align: center;">
+                        <span style="color: {sentiment_color}; font-weight: bold;">
+                            Sentiment Score: {row['sentiment_score']:.2f}
+                        </span>
+                    </div>
+                """, unsafe_allow_html=True)
+
+        # Data explorer
+        with st.expander("Data Explorer"):
+            st.dataframe(sentiment_data)
+
+            # Allow downloading data
+            csv = sentiment_data.to_csv(index=False)
+            st.download_button(
+                label="Download Data as CSV",
+                data=csv,
+                file_name="spectranlp_sentiment_data.csv",
+                mime="text/csv"
+            )
+    else:
+        if run_analysis:
+            st.warning("No data found for the selected sources, keywords, and date range.")
+
+# Footer
+st.markdown("---")
+st.markdown("""
+    <div style="text-align: center;">
+        <p>SpectraNLP - Sentiment Analysis Platform | Source code available on <a href="https://github.com/josephy02/SpectraNLP">GitHub</a></p>
+    </div>
+""", unsafe_allow_html=True)
 
 if __name__ == "__main__":
-    main()
+    # This block will be executed when the script is run directly
+    pass
